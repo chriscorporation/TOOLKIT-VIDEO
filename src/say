@@ -1,0 +1,31 @@
+#!/bin/bash
+# say — sustituto Linux del `say` de macOS con la interfaz que usan los skills:
+#   say [-v voz] [-r palabras/min] [-o salida.aiff|.wav|.m4a] [-f archivo.txt] [texto…]
+# Motor: SAY_ENGINE=espeak (local, por defecto) · edge (neural, requiere red) · piper (local, PIPER_MODEL=<voz.onnx>).
+# Las voces de macOS se traducen (Paulina/Juan → español de México); cualquier otra se pasa tal cual al motor.
+set -euo pipefail
+voice=""; rate=""; out=""; file=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) voice=$2; shift 2 ;;  -r) rate=$2; shift 2 ;;
+        -o) out=$2; shift 2 ;;    -f) file=$2; shift 2 ;;
+        --) shift; break ;;       *) break ;;
+    esac
+done
+text=${*:-}; [ -n "$file" ] && text=$(cat "$file"); [ -z "$text" ] && text=$(cat)
+[ -n "$out" ] || { echo "say: en el contenedor no hay altavoz; usa -o archivo" >&2; exit 1; }
+engine=${SAY_ENGINE:-espeak}; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+case "$voice" in
+    Paulina|Juan|Monica|Mónica|Diego|"") es=es-419; edge=es-MX-DaliaNeural; [ "$voice" = Juan ] || [ "$voice" = Diego ] && edge=es-MX-JorgeNeural ;;
+    *) es=$voice; edge=$voice ;;
+esac
+case "$engine" in
+    edge)   edge-tts --voice "$edge" ${rate:+--rate "+$(( (rate - 175) * 100 / 175 ))%"} --text "$text" --write-media "$tmp/a.mp3"; src=$tmp/a.mp3 ;;
+    piper)  printf '%s' "$text" | piper --model "${PIPER_MODEL:?define PIPER_MODEL con la ruta a la voz .onnx}" --output_file "$tmp/a.wav"; src=$tmp/a.wav ;;
+    *)      espeak-ng -v "$es" ${rate:+-s "$rate"} -w "$tmp/a.wav" "$text"; src=$tmp/a.wav ;;
+esac
+case "${out##*.}" in
+    aiff|aif) ffmpeg -hide_banner -loglevel error -y -i "$src" -c:a pcm_s16be "$out" ;;
+    m4a|aac)  ffmpeg -hide_banner -loglevel error -y -i "$src" -c:a aac -b:a 128k "$out" ;;
+    *)        ffmpeg -hide_banner -loglevel error -y -i "$src" "$out" ;;
+esac

@@ -1,0 +1,53 @@
+#!/opt/venv/bin/python3
+"""sips — sustituto Linux (Pillow) del `sips` de macOS para lo que usan los skills:
+  sips -g pixelWidth -g pixelHeight -g hasAlpha -g format <img…>
+  sips -s format png|jpeg|tiff|bmp|gif|heic <img> --out <archivo|dir>
+  sips -z <alto> <ancho> | -Z <max> | --resampleWidth <w> | --resampleHeight <h>  <img> [--out …]
+  sips --setProperty hasAlpha no <img> [--out …]     (aplana el alfa sobre blanco)
+Sin --out modifica el archivo en su lugar, como sips."""
+import os, sys
+from PIL import Image
+
+args = sys.argv[1:]; gets, sets, out, size, fmt, flatten, files = [], [], None, None, None, False, []
+i = 0
+while i < len(args):
+    a = args[i]
+    if a in ('-g', '--getProperty'): gets.append(args[i + 1]); i += 2
+    elif a in ('-s', '--setProperty'):
+        k, v = args[i + 1], args[i + 2]; i += 3
+        if k == 'format': fmt = v.lower()
+        elif k == 'hasAlpha' and v.lower() in ('no', 'false', '0'): flatten = True
+        else: sets.append((k, v))
+    elif a == '-z': size = ('exact', int(args[i + 2]), int(args[i + 1])); i += 3
+    elif a in ('-Z', '--resampleHeightWidthMax'): size = ('max', int(args[i + 1])); i += 2
+    elif a == '--resampleWidth': size = ('w', int(args[i + 1])); i += 2
+    elif a == '--resampleHeight': size = ('h', int(args[i + 1])); i += 2
+    elif a in ('-o', '--out'): out = args[i + 1]; i += 2
+    else: files.append(a); i += 1
+if not files: sys.exit(__doc__)
+EXT = {'jpeg': 'jpg', 'jpg': 'jpg', 'png': 'png', 'tiff': 'tiff', 'bmp': 'bmp', 'gif': 'gif', 'heic': 'heic', 'webp': 'webp'}
+PILF = {'jpg': 'JPEG', 'png': 'PNG', 'tiff': 'TIFF', 'bmp': 'BMP', 'gif': 'GIF', 'webp': 'WEBP', 'heic': 'HEIF'}
+for f in files:
+    im = Image.open(f)
+    if gets:
+        print(os.path.abspath(f))
+        for g in gets:
+            v = {'pixelWidth': im.width, 'pixelHeight': im.height, 'format': (im.format or '').lower(),
+                 'hasAlpha': 'yes' if im.mode in ('RGBA', 'LA', 'PA') or 'transparency' in im.info else 'no'}.get(g, '<nil>')
+            print(f'  {g}: {v}')
+        if not (size or fmt or flatten): continue
+    if size:
+        w, h = im.size
+        if size[0] == 'exact': nw, nh = size[1], size[2]
+        elif size[0] == 'max': r = size[1] / max(w, h); nw, nh = round(w * r), round(h * r)
+        elif size[0] == 'w': nw, nh = size[1], round(h * size[1] / w)
+        else: nw, nh = round(w * size[1] / h), size[1]
+        im = im.resize((nw, nh), Image.LANCZOS)
+    ext = EXT.get(fmt or '', os.path.splitext(f)[1][1:].lower() or 'png')
+    if flatten or PILF.get(ext) == 'JPEG':
+        if im.mode in ('RGBA', 'LA', 'PA', 'P'):
+            bg = Image.new('RGB', im.size, 'white'); im = im.convert('RGBA'); bg.paste(im, mask=im.split()[-1]); im = bg
+    dst = out or f
+    if os.path.isdir(dst): dst = os.path.join(dst, os.path.splitext(os.path.basename(f))[0] + '.' + ext)
+    im.save(dst, PILF.get(ext, ext.upper()))
+    print(f'{os.path.abspath(f)}\n  {os.path.abspath(dst)}')

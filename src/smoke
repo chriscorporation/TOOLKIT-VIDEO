@@ -1,0 +1,90 @@
+#!/bin/bash
+# smoke — prueba la imagen por dentro. Sin GPU (Docker local / CI) las pruebas de GPU avisan y no fallan;
+# en el pod real: SMOKE_GPU=1 smoke  → NVENC, OptiX/CUDA y Vulkan pasan a ser obligatorias.
+set -uo pipefail
+export PATH=/opt/ffmpeg:/opt/venv/bin:$PATH
+T=$(mktemp -d); cd "${T:?}" || exit 1; P=0; F=0; W=0
+ok()   { P=$((P+1)); printf '  ok    %s\n' "$1"; }
+bad()  { F=$((F+1)); printf '  FALLA %s\n' "$1"; }
+warn() { W=$((W+1)); printf '  aviso %s\n' "$1"; }
+t()    { local n=$1; shift; if "$@" >"$T/log" 2>&1; then ok "$n"; else bad "$n"; sed 's/^/        /' "$T/log" | tail -5; fi; }
+tg()   { local n=$1; shift; if "$@" >"$T/log" 2>&1; then ok "$n"; elif [ "${SMOKE_GPU:-0}" = 1 ]; then bad "$n"; sed 's/^/        /' "$T/log" | tail -5; else warn "$n (requiere GPU; no obligatoria sin SMOKE_GPU=1)"; fi; }
+
+echo "== binarios"
+for b in ffmpeg ffprobe blender manim post vfx sox magick exiftool gifski yt-dlp gallery-dl instaloader auto-editor scenedetect edge-tts \
+         node hyperframes whisper-cli espeak-ng vulkaninfo  higgsfield playwright-mcp xvfb-run \
+         mediainfo rubberband tesseract potrace cwebp pngquant rsvg-convert pdftoppm gs rclone aria2c jq rg fd uv vips jpegoptim gifsicle MP4Box oxipng resvg ffmpeg-normalize ffmpeg-quality-metrics ffsubsync piper audio-separator c2patool say sips mlx_whisper m1-post m1-vfx m1-review-pack \
+         google-chrome pm2 Xvnc vncpasswd websockify uuidgen viewers chrome-userscripts; do t "$b" command -v "$b"; done
+t "python: faster_whisper, cairo, PIL, numpy" python3 -c "import faster_whisper, cairo, PIL, numpy"
+t "python: audio, visión, APIs" python3 -c "import pyloudnorm, librosa, pydub, soundfile, cv2, scenedetect, playwright, elevenlabs, anthropic, openai, googleapiclient, google.genai, google.oauth2, rembg, pysubs2, kokoro_onnx, opentimelineio, pyvips"
+t "ffmpeg: libass, freetype, loudnorm, perspective" bash -c "ffmpeg -hide_banner -filters | grep -qE ' subtitles ' && ffmpeg -hide_banner -filters | grep -q ' loudnorm ' && ffmpeg -hide_banner -filters | grep -q ' perspective ' && ffmpeg -hide_banner -buildconf | grep -q enable-libfreetype"
+t "fuentes: Noto, Inter, Montserrat, Bebas Neue" bash -c "fc-list | grep -q NotoSans- && fc-list | grep -qi Inter && fc-list | grep -qi Montserrat && fc-list | grep -qi Bebas"
+t "fuentes: Liberation y DejaVu" bash -c "test -f /usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf && test -f /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+
+echo "== Google Chrome estable "
+t "google-chrome headless (marca, no for Testing)" bash -c "google-chrome --version | grep -q '^Google Chrome [0-9]' && timeout 60 google-chrome --headless=new --no-sandbox --disable-gpu --user-data-dir=$T/gc --dump-dom 'data:text/html,<h1>gc-ok</h1>' 2>/dev/null | grep -q gc-ok"
+t "carga de extensión por CDP (Extensions.loadUnpacked)" bash -c "mkdir -p $T/ext && printf '{\"manifest_version\":3,\"name\":\"smoke\",\"version\":\"1\"}' > $T/ext/manifest.json && (CHROME_PROFILE=$T/gcx CHROME_EXTENSIONS=$T/ext CHROME_DEBUG_PORT=9333 CHROME_SETTLE_MS=60000 timeout 25 xvfb-run -a node /opt/podtools/chrome-viewers.mjs --no-sandbox about:blank 2>/dev/null || true) | grep -q 'extensión ✓'"
+
+echo "== post (ffmpeg, CPU)"
+ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=s=640x360:r=30:d=4 -f lavfi -i sine=f=440:d=4 -c:v libx264 -pix_fmt yuv420p -c:a aac a.mp4
+ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc=s=640x360:r=30:d=2 -f lavfi -i sine=f=330:d=2 -c:v libx264 -pix_fmt yuv420p -c:a aac b.mp4
+printf '1\n00:00:00,500 --> 00:00:02,000\nHola desde Linux ñandú\n\n' > s.srt
+for c in "info a.mp4" "trim a.mp4 0 2 trim.mp4" "speed a.mp4 1.5 speed.mp4" "concat cat.mp4 a.mp4 b.mp4" "xfade a.mp4 b.mp4 xf.mp4" \
+         "loudness a.mp4 loud.mp4" "voice a.mp4 voice.mp4" "denoise a.mp4 dn.mp4" "color a.mp4 col.mp4" "zoom a.mp4 100 60 200 120 1 2 zoom.mp4" \
+         "burn a.mp4 s.srt burn.mp4" "title a.mp4 Prueba:Linux title.mp4 0 3" "frame a.mp4 frame.mp4" "youtube a.mp4 yt.mp4 720" "gif a.mp4 out.gif 320 10" "thumb a.mp4 1 thumb.png" \
+         "chroma a.mp4 chroma.mov"; do t "post $c" post $c; done
+printf '0.5 2.5 sub "Hola desde Linux"\n0.2 3 chip "Paso 1/2 · Prueba"\n1 3 keys "⌘ B"\n' > capas.txt
+t "post layers a.mp4 capas.txt layers.mp4" post layers a.mp4 capas.txt layers.mp4
+printf '%s\n' '{"epoch":100.0,"cmd":"sync","args":[0,0],"env":{}}' '{"epoch":100.5,"cmd":"circle","args":[320,180,60],"env":{}}' '{"epoch":101.0,"cmd":"box","args":[100,80,200,120],"env":{}}' > tl.jsonl
+t "post marks a.mp4 tl.jsonl marks.mp4" post marks a.mp4 tl.jsonl marks.mp4 --area 0,0,640,360 --sync-video 0
+t "post mix/duck" bash -c "post mix mix.m4a a.mp4:1 b.mp4:0.5 >/dev/null && post duck a.mp4 b.mp4 duck.m4a >/dev/null"
+t "salidas no vacías" bash -c 'for f in trim.mp4 speed.mp4 cat.mp4 xf.mp4 loud.mp4 voice.mp4 dn.mp4 col.mp4 zoom.mp4 burn.mp4 title.mp4 frame.mp4 yt.mp4 thumb.png out.gif chroma.mov mix.m4a duck.m4a layers.mp4 marks.mp4; do test -s "$f" || { echo "vacío o ausente: $f"; exit 1; }; done'
+t "captions (faster-whisper tiny, CPU)" env WHISPER_MODEL=tiny WHISPER_CACHE="$T/w" post captions a.mp4 en
+
+echo "== vfx"
+t "vfx tools" vfx tools
+cat > cube.py <<'PY'
+import bpy
+s = bpy.context.scene
+s.render.engine = 'CYCLES'; s.cycles.device = 'CPU'; s.cycles.samples = 4
+s.render.resolution_x = s.render.resolution_y = 64
+s.render.filepath = '/tmp/smoke-blender.png'
+bpy.ops.render.render(write_still=True)
+PY
+t "blender Cycles CPU" bash -c "blender -b --factory-startup --python cube.py >/dev/null 2>&1; test -s /tmp/smoke-blender.png"
+cat > esc.py <<'PY'
+from manim import *
+class Esc(Scene):
+    def construct(self):
+        self.play(Create(Circle()), run_time=0.5)
+PY
+t "manim (escena mínima)" vfx manim esc.py Esc l
+magick -size 64x64 gradient:red-blue in.png
+tg "Real-ESRGAN (Vulkan)" bash -c "vfx upscale in.png 4 up.png >/dev/null && test -s up.png"
+tg "RIFE interpolación (Vulkan)" bash -c "vfx interp a.mp4 2 interp.mp4 >/dev/null && test -s interp.mp4"
+tg "ffmpeg h264_nvenc" ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc=s=640x360:d=1 -c:v h264_nvenc nv.mp4
+tg "Blender Cycles GPU (OptiX/CUDA)" bash -c "blender -b --factory-startup --python-exit-code 1 --python-expr \"import bpy;p=bpy.context.preferences.addons['cycles'].preferences;p.compute_device_type='OPTIX';p.get_devices();assert any(d.type!='CPU' for d in p.devices)\" >/dev/null 2>&1"
+tg "nvidia-smi" nvidia-smi
+
+echo "== equivalentes de macOS"
+t "say (espeak-ng) → aiff" bash -c "say -v Paulina -o say.aiff 'Hola desde Linux' && test -s say.aiff"
+t "sips -g / -s format / -Z" bash -c "magick -size 300x200 xc:red s.png && sips -g pixelWidth -g hasAlpha s.png | grep -q 'pixelWidth: 300' && sips -s format jpeg s.png --out s.jpg >/dev/null && sips -Z 100 s.jpg >/dev/null && test -s s.jpg"
+t "mlx_whisper → srt (faster-whisper tiny)" bash -c "WHISPER_CACHE=$T/w mlx_whisper a.mp4 --model mlx-community/whisper-tiny --output-format srt --output-dir mw >/dev/null && test -f mw/a.srt"
+
+echo "== navegador y agentes"
+cat > nav.py <<'PY2'
+import sys
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    # Con ventana bajo Xvfb no hay GL: sin --disable-gpu, Page.captureScreenshot falla («Unable to capture screenshot»).
+    b = p.chromium.launch(headless=sys.argv[1] == "1", args=["--no-sandbox"] + ([] if sys.argv[1] == "1" else ["--disable-gpu"]))
+    pg = b.new_page(); pg.set_content("<h1 style='font:64px sans-serif'>Hola ñandú 🎬</h1>")
+    pg.screenshot(path=sys.argv[2]); b.close()
+PY2
+t "Chromium headless (Playwright)" bash -c "python3 nav.py 1 nav.png && test -s nav.png"
+t "Chromium con ventana (Xvfb)" bash -c "xvfb-run -a -s '-screen 0 1920x1080x24' python3 nav.py 0 navx.png && test -s navx.png"
+t "whisper-cli --help" bash -c "whisper-cli --help 2>&1 | grep -qi usage"
+t "hyperframes browser path" hyperframes browser path
+t "hyperframes render (blank, 1 s)" bash -c "HYPERFRAMES_SKIP_SKILLS=1 hyperframes init hf --example blank --non-interactive >/dev/null 2>&1 && hyperframes render hf -q draft -o hf.mp4 >/dev/null 2>&1 && test -s hf.mp4"
+
+echo; echo "resultado: $P ok · $W avisos · $F fallas"; cd /; rm -rf "${T:?}"; [ $F -eq 0 ]

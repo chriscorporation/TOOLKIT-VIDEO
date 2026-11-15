@@ -1,0 +1,34 @@
+#!/opt/venv/bin/python3
+"""mlx_whisper — sustituto Linux (faster-whisper, CPU/CUDA) del CLI de mlx-whisper con sus flags habituales:
+  mlx_whisper <audio…> [--model mlx-community/whisper-large-v3-turbo] [--language es] [--output-format srt|vtt|txt|json|all]
+              [--output-dir DIR] [--output-name NOMBRE] [--word-timestamps True]
+Los nombres de modelo mlx-community/whisper-<x>[-mlx] se traducen al modelo equivalente de faster-whisper."""
+import argparse, json, os, re
+from faster_whisper import WhisperModel
+
+p = argparse.ArgumentParser(); p.add_argument('audio', nargs='+')
+p.add_argument('--model', default='large-v3-turbo'); p.add_argument('--language', default=None)
+p.add_argument('--output-format', '-f', default='txt'); p.add_argument('--output-dir', '-o', default='.')
+p.add_argument('--output-name', default=None); p.add_argument('--word-timestamps', default='False')
+p.add_argument('--task', default='transcribe')
+a, _ = p.parse_known_args()
+name = re.sub(r'^.*/', '', a.model); name = re.sub(r'^whisper-|-mlx.*$|-(4|8)bit$', '', name)
+dev = 'cuda' if os.environ.get('PODTOOLS_FLAVOR') == 'gpu' else 'cpu'
+model = WhisperModel(name, device=dev, compute_type='float16' if dev == 'cuda' else 'int8',
+                     download_root=os.environ.get('WHISPER_CACHE'))
+ts = lambda s, sep: f'{int(s // 3600):02}:{int(s % 3600 // 60):02}:{int(s % 60):02}{sep}{int(s % 1 * 1000):03}'
+os.makedirs(a.output_dir, exist_ok=True)
+for au in a.audio:
+    segs, info = model.transcribe(au, language=a.language, task=a.task, word_timestamps=a.word_timestamps.lower() == 'true')
+    segs = list(segs); base = os.path.join(a.output_dir, a.output_name or os.path.splitext(os.path.basename(au))[0])
+    fmts = ['txt', 'srt', 'vtt', 'json'] if a.output_format == 'all' else [a.output_format]
+    for f in fmts:
+        with open(f'{base}.{f}', 'w', encoding='utf-8') as o:
+            if f == 'txt': o.write('\n'.join(s.text.strip() for s in segs) + '\n')
+            elif f == 'srt': o.write(''.join(f'{i}\n{ts(s.start, ",")} --> {ts(s.end, ",")}\n{s.text.strip()}\n\n' for i, s in enumerate(segs, 1)))
+            elif f == 'vtt': o.write('WEBVTT\n\n' + ''.join(f'{ts(s.start, ".")} --> {ts(s.end, ".")}\n{s.text.strip()}\n\n' for s in segs))
+            else: json.dump({'text': ''.join(s.text for s in segs), 'language': info.language, 'segments': [
+                {'id': i, 'start': s.start, 'end': s.end, 'text': s.text,
+                 'words': [{'word': w.word, 'start': w.start, 'end': w.end, 'probability': w.probability} for w in (s.words or [])]}
+                for i, s in enumerate(segs)]}, o, ensure_ascii=False, indent=1)
+    print(base)

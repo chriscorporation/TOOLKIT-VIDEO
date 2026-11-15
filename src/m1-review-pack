@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""m1-review-pack — builds the evidence package the tutorial reviewers (UX + cinematographer) work from.
+
+usage: m1-review-pack <video> <guion.txt> [--narration narr.txt] [--trim S] [--out DIR] [--offset S]
+
+Output DIR (default: <video-dir>/review-<video-name>/):
+  frames/NNN_<t>_<cmd>.jpg   one full-width frame per visual beat of the script (0.9 s after the line, when it is drawn)
+  sheet.jpg                  contact sheet of every beat
+  manifest.md                metrics, script→video offset, beat table, on-screen text with reading-speed check,
+                             narration lines, loudness per second
+Times: final video time = script time − offset − trim. The offset is measured from the black curtains
+(`transition` lines) unless --offset is given; --trim is what the post cut from the head.
+"""
+import argparse, json, os, re, shlex, statistics, subprocess
+
+FF = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y']
+# Labels need drawtext (freetype); Homebrew core ffmpeg 9 lacks it, M1-Post ships a full static build for that.
+_FULL = os.path.expanduser('~/.local/share/m1-post/bin/ffmpeg')  # en Linux el ffmpeg de PATH ya es completo
+FFT = ([_FULL] if os.path.exists(_FULL) else ['ffmpeg']) + FF[1:]
+VISUAL = ('subtitle', 'step', 'circle', 'box', 'highlight', 'spotlight', 'spotlight-circle', 'arrow', 'transition',
+          'bullets', 'callout', 'text', 'point', 'fx', 'model', 'underline', 'bracket', 'image', 'video', 'lottie')
+READ_CPS = 15.0   # comfortable reading speed for on-screen Spanish text (characters per second)
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def probe(video):
+    j = json.loads(run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration:stream=codec_type,width,height',
+                        '-of', 'json', video]).stdout)
+    v = next(s for s in j['streams'] if s['codec_type'] == 'video')
+    return float(j['format']['duration']), int(v['width']), int(v['height']), any(s['codec_type'] == 'audio' for s in j['streams'])
+
+
+def parse_script(path):
+    beats = []
+    for line in open(path, encoding='utf-8'):
+        line = line.rstrip('\n')
+        m = re.match(r'^\s*(\d+(?:\.\d+)?)\s+(.*)$', line)
+        if not m or line.lstrip().startswith('#'):
+            continue
+        t, rest = float(m.group(1)), m.group(2).strip()
+        bid = None
+        if rest.startswith('@'):
+            bid, _, rest = rest.partition(' ')
+            bid = bid[1:]
+        try:
+            words = shlex.split(rest)
+        except ValueError:
+            words = rest.split()
+        while words and re.match(r'^MARK_[A-Z]+=', words[0]):
+            words.pop(0)
+        if words:
+            beats.append({'t': t, 'id': bid, 'cmd': words[0], 'args': words[1:]})
+    return beats
+
+
+def curtains(video, width=32, height=20):
+    """Video seconds where the screen turns (almost) black — the start of each curtain."""
+    p = subprocess.run(FF + ['-i', video, '-vf', f'fps=10,scale={width}:{height},format=gray', '-f', 'rawvideo', '-'],
+                       capture_output=True)
+    n = width * height
+    dark = [sum(p.stdout[i * n:(i + 1) * n]) / n < 30 for i in range(len(p.stdout) // n)]
+    return ([0.0] if dark and dark[0] else []) + [i / 10 for i in range(1, len(dark)) if dark[i] and not dark[i - 1]]
+
+
+def loudness_per_second(video):
+    err = run(['ffmpeg', '-hide_banner', '-v', 'verbose', '-i', video, '-af', 'ebur128=framelog=verbose', '-f', 'null', '-']).stderr
+    res = {}
+    for t, m in re.findall(r't:\s*([\d.]+)\s+TARGET.*?M:\s*(-?[\d.]+|-inf)', err):
+        if m != '-inf':
+            res[int(float(t))] = max(res.get(int(float(t)), -99.0), float(m))
+    # The per-frame log also prints running 'I:' values; the integrated loudness is the one in the final Summary.
+    summ = err[err.rfind('Summary:'):] if 'Summary:' in err else err
+    integ = re.search(r'I:\s+(-?[\d.]+) LUFS', summ)
+    return res, (float(integ.group(1)) if integ else None)
+
+
+def contact_sheet(rows, out):
+    cols, tiles = 4, []
+    for tv, b, f in rows:
+        tile = f.replace('.jpg', '.tile.jpg')
+        label = f'{tv:.1f}s {b["cmd"]}'
+        subprocess.run(FFT + ['-i', f, '-vf', f"scale=480:-2,drawtext=text='{label}':x=6:y=6:fontsize=18:fontcolor=yellow:"
+                             "box=1:boxcolor=black@0.6", tile])
+        if not os.path.exists(tile):   # ffmpeg without drawtext (no freetype): plain tile
+            subprocess.run(FF + ['-i', f, '-vf', 'scale=480:-2', tile], stderr=subprocess.DEVNULL)
+        tiles.append(tile)
+    while len(tiles) % cols:
+        tiles.append(tiles[-1])
+    n = len(tiles)
+    layout = '|'.join(f"{'+'.join(['w0'] * (k % cols)) or '0'}_{'+'.join(['h0'] * (k // cols)) or '0'}" for k in range(n))
+    subprocess.run(FF + sum([['-i', t] for t in tiles], []) + ['-filter_complex', f'xstack=inputs={n}:layout={layout}', out])
+    for t in set(tiles):
+        os.path.exists(t) and os.remove(t)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('video'); ap.add_argument('script')
+    ap.add_argument('--narration'); ap.add_argument('--trim', type=float, default=0.0)
+    ap.add_argument('--offset', type=float); ap.add_argument('--out')
+    a = ap.parse_args()
+    name = os.path.splitext(os.path.basename(a.video))[0]
+    out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.video)), f'review-{name}')
+    os.makedirs(os.path.join(out, 'frames'), exist_ok=True)
+    dur, W, H, has_audio = probe(a.video)
+    beats = parse_script(a.script)
+
+    # Offset: a `transition` darkens the screen ~0.5 s after its line; match curtains to transitions in order.
+    found, trans = curtains(a.video), [b['t'] for b in beats if b['cmd'] == 'transition']
+    if a.offset is not None:
+        offset, how = a.offset, 'dado (--offset)'
+    elif found and trans:
+        pairs = list(zip(trans[-len(found):] if len(found) < len(trans) else trans, found))
+        diffs = [s + 0.5 - (v + a.trim) for s, v in pairs]
+        offset, how = statistics.median(diffs), f'medido con {len(pairs)} cortinillas, dispersión {max(diffs) - min(diffs):.2f} s'
+    else:
+        offset, how = 0.0, 'sin cortinillas: se asume 0'
+    to_video = lambda t: t - offset - a.trim
+
+    rows = []
+    for i, b in enumerate(beats):
+        pet = b['cmd'] == 'ctl' and b['args'][1:2] and b['args'][1] in ('move', 'say', 'anim', 'orbit')
+        if b['cmd'] not in VISUAL and not pet:
+            continue
+        tv = to_video(b['t']) + 0.9
+        if 0 <= tv < dur:
+            f = os.path.join(out, 'frames', f'{i:03d}_{tv:05.1f}_{b["cmd"]}.jpg')
+            subprocess.run(FF + ['-ss', f'{tv:.2f}', '-i', a.video, '-frames:v', '1', '-vf', 'scale=1920:-2', '-q:v', '3', f])
+            rows.append((tv, b, f))
+    if rows:
+        contact_sheet(rows, os.path.join(out, 'sheet.jpg'))
+
+    # On-screen text: how long each subtitle/title/bubble stays vs. what it needs to be read.
+    texts, subs = [], [b for b in beats if b['cmd'] == 'subtitle']
+    for k, b in enumerate(subs):
+        end = subs[k + 1]['t'] if k + 1 < len(subs) else next((x['t'] for x in beats if x['cmd'] == 'clear' and x['t'] > b['t']), b['t'] + 6)
+        txt = ' '.join(b['args']); texts.append(('subtítulo', to_video(b['t']), end - b['t'], txt, len(txt) / READ_CPS + 1.0))
+    for b in beats:
+        if b['cmd'] == 'transition':
+            hold = float(b['args'][1]) if len(b['args']) > 1 else 1.2
+            txt = ' '.join(b['args'][2:]); texts.append(('título', to_video(b['t']), hold + 0.6, txt, len(txt) / READ_CPS + 0.6))
+        if b['cmd'] == 'ctl' and b['args'][1:2] == ['say']:
+            txt = ' '.join(b['args'][2:]); texts.append(('globo', to_video(b['t']), max(2.5, len(txt) / 12), txt, len(txt) / READ_CPS + 0.8))
+        # Composed text (HyperFrames/post layers): `text <seconds on screen> <texto>` declares its real time on screen.
+        if b['cmd'] == 'text' and b['args'] and re.fullmatch(r'\d+(?:\.\d+)?', b['args'][0]):
+            txt = ' '.join(b['args'][1:]); texts.append(('texto', to_video(b['t']), float(b['args'][0]), txt, len(txt) / READ_CPS + 0.6))
+    # A row without text has nothing to read: it used to "need" 0.6 s and always pass (false ✅ on bare transitions).
+    texts = sorted((x for x in texts if x[3].strip()), key=lambda x: x[1])
+
+    narr = []
+    if a.narration and os.path.exists(a.narration):
+        for line in open(a.narration, encoding='utf-8'):
+            if '|' in line and not line.startswith('#'):
+                t, txt = line.rstrip('\n').split('|', 1)
+                narr.append((float(t), txt))
+
+    loud, integ = loudness_per_second(a.video) if has_audio else ({}, None)
+    with open(os.path.join(out, 'manifest.md'), 'w', encoding='utf-8') as m:
+        m.write(f'# Paquete de revisión — {name}\n\n')
+        m.write(f'- Video: `{a.video}` · {W}×{H} · {dur:.1f} s · audio: {"sí" if has_audio else "no"}'
+                f'{f" · {integ} LUFS integrados" if integ is not None else ""}\n')
+        m.write(f'- Guion: `{a.script}` · desfase guion→video: **{offset:+.2f} s** ({how}) · recorte inicial: {a.trim} s\n')
+        m.write(f'- Cortinillas detectadas (s de video): {found}\n- Hoja de contacto: `sheet.jpg` · cuadros 1920 px: `frames/`\n\n')
+        m.write('## Momentos visuales (cuadro 0.9 s después de cada línea)\n\n| s video | id | comando | argumentos | cuadro |\n|---|---|---|---|---|\n')
+        for tv, b, f in rows:
+            m.write(f'| {tv:.1f} | {b["id"] or ""} | {b["cmd"]} | {" ".join(b["args"])[:70]} | `{os.path.basename(f)}` |\n')
+        m.write(f'\n## Texto en pantalla (lectura cómoda ≈ {READ_CPS:.0f} caracteres/s + 1 s)\n\n'
+                '| tipo | s video | en pantalla | necesita | ok | texto |\n|---|---|---|---|---|---|\n')
+        for kind, tv, shown, txt, need in texts:
+            m.write(f'| {kind} | {tv:.1f} | {shown:.1f} s | {need:.1f} s | {"✅" if shown >= need else "❌"} | {txt[:60]} |\n')
+        if not texts:
+            m.write('| — | — | — | — | ⚠️ | sin textos declarados: agrega líneas `text <s en pantalla> <texto>` al guion para validarlos |\n')
+        if narr:
+            m.write('\n## Narración (s del video final)\n\n| s | texto |\n|---|---|\n' + ''.join(f'| {t:.1f} | {x} |\n' for t, x in narr))
+        if loud:
+            m.write('\n## Sonoridad momentánea máx. por segundo (LUFS)\n\n' + ' · '.join(f'{s}s:{v:.0f}' for s, v in sorted(loud.items())) + '\n')
+    print(out)
+
+
+if __name__ == '__main__':
+    main()

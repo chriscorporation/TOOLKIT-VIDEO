@@ -1,0 +1,79 @@
+#!/bin/bash
+# vfx — 3D, VFX e IA de video SIN interfaz en el pod (port Linux/NVIDIA de m1-vfx).
+# IA SOBRE VIDEO / IMAGEN (ncnn + Vulkan sobre la GPU NVIDIA; VFX_GPU=-1 fuerza CPU)
+#   upscale <in> [2|3|4] [out] [photo|screen]     escala imagen o video con IA (Real-ESRGAN; screen = UI/texto)
+#   interp <in> [2|4] [out]                        interpola cuadros con RIFE (30→60 fps, movimiento fluido)
+#   slowmo <in> [2|4|8] [out]                      cámara lenta suave (RIFE + reloj más lento)
+# RENDER 3D
+#   blender <archivo.blend|script.py> [out_dir] [frames 1-120]   Cycles con GPU OptiX/CUDA, sin ventana
+# MOTION GRAPHICS / COMPOSICIÓN
+#   manim <archivo.py> <Escena> [l|m|h|k] [alpha] animación explicativa (alpha = .mov transparente)
+#   compose <archivo.blend> [out_dir] [frames]    compositor por nodos de Blender (alternativa a Nuke/AE)
+#   tools                                          qué está instalado y versiones
+set -euo pipefail
+export PATH=/opt/ffmpeg:/opt/venv/bin:$HOME/.local/bin:$PATH
+V=${NCNN_HOME:-/opt/ncnn}; G=${VFX_GPU:-0}; FF="ffmpeg -hide_banner -loglevel error -y"
+BLENDER=${BLENDER:-/opt/blender/blender}
+name() { local b; b=$(basename "$1"); echo "${b%.*}"; }
+isvideo() { case "${1##*.}" in mp4|mov|m4v|webm|mkv|avi) return 0 ;; *) return 1 ;; esac; }
+fps() { ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$1"; }
+
+# frames <video> <fn>: explode a video, run fn <in_dir> <out_dir>, rebuild with the original audio at fps*mult.
+frames() {
+  local in=$1 fn=$2 out=$3 mult=${4:-1} t; t=$(mktemp -d); mkdir "$t/i" "$t/o"
+  $FF -i "$in" -fps_mode passthrough "$t/i/%06d.png"
+  "$fn" "$t/i" "$t/o"
+  local r; r=$(fps "$in"); r=$(python3 -c "from fractions import Fraction as F;print(F('$r')*$mult)")
+  $FF -framerate "$r" -i "$t/o/%06d.png" -i "$in" -map 0:v -map 1:a? -c:v libx264 -crf 16 -pix_fmt yuv420p -c:a copy -shortest "$out"
+  rm -rf "$t"; echo "$out"
+}
+
+cmd=${1:-}; shift || true
+case $cmd in
+  upscale)
+    in=$1; s=${2:-2}; kind=${4:-}
+    [ -z "$kind" ] && { isvideo "$in" && kind=screen || kind=photo; }
+    if [ "$kind" = screen ]; then model=realesr-animevideov3; else model=realesrgan-x4plus; [ "$s" != 4 ] && s=4; fi
+    out=${3:-$(dirname "$in")/$(name "$in")-x$s.$( isvideo "$in" && echo mp4 || echo png)}
+    run() { "$V/realesrgan/realesrgan-ncnn-vulkan" -i "$1" -o "$2" -n $model -s $s -m "$V/realesrgan/models" -g "$G" -f png >/dev/null 2>&1; }
+    if isvideo "$in"; then frames "$in" run "$out"; else run "$in" "$out"; echo "$out"; fi ;;
+  interp|slowmo)
+    in=$1; m=${2:-2}; out=${3:-$(dirname "$in")/$(name "$in")-$cmd$m.mp4}
+    run() {  # RIFE doubles per pass; chain passes for 4x/8x
+      local a=$1 b n=$m p=0; while [ "$n" -gt 1 ]; do b=$(mktemp -d)
+        (cd "$V/rife" && ./rife-ncnn-vulkan -i "$a" -o "$b" -m rife-v4.6 -g "$G" -f %06d.png >/dev/null 2>&1)
+        [ $p -gt 0 ] && rm -rf "$a"; a=$b; n=$((n/2)); p=1; done
+      mv "$a"/* "$2"/; rmdir "$a"; }
+    if [ "$cmd" = interp ]; then frames "$in" run "$out" "$m"
+    else t=$(mktemp -d)/x.mp4; frames "$in" run "$t" 1 >/dev/null; $FF -i "$t" -an -c:v copy "$out"; rm -rf "$(dirname "$t")"; echo "$out"; fi ;;
+  image) echo "vfx image: FLUX (mflux) usa MLX y solo existe en la M1; en el pod entrará con diffusers" >&2; exit 1 ;;
+  blender)
+    in=$1; out=${2:-$(dirname "$in")/$(name "$in")-render}; mkdir -p "$out"; fr=${3:-}
+    gpu="import bpy;p=bpy.context.preferences.addons['cycles'].preferences;p.compute_device_type='OPTIX' if 'OPTIX' in [x.id for x in p.get_device_types(bpy.context)] else 'CUDA';p.get_devices();[setattr(d,'use',d.type!='CPU') for d in p.devices];bpy.context.scene.cycles.device='GPU'"
+    case $in in
+      *.py) "$BLENDER" -b --factory-startup -t "${VFX_THREADS:-0}" --python-expr "$gpu" --python "$in" -- "$out" ;;
+      *) if [ -n "$fr" ]; then "$BLENDER" -b --factory-startup -t "${VFX_THREADS:-0}" "$in" --python-expr "$gpu" -o "$out/####" -s "${fr%-*}" -e "${fr#*-}" -a
+         else "$BLENDER" -b --factory-startup -t "${VFX_THREADS:-0}" "$in" --python-expr "$gpu" -o "$out/####" -f 1; fi ;;
+    esac | grep -E "Saved|Error|Time:" | tail -3; echo "$out" ;;
+  manim)
+    f=$1; sc=$2; q=${3:-h}; extra=; [ "${4:-}" = alpha ] && extra="--transparent --format=mov"
+    (cd "$(dirname "$f")" && manim -q "$q" $extra --disable_caching "$(basename "$f")" "$sc" 2>&1 | grep -E "File ready|Error" | tail -2) ;;
+  shader) echo "vfx shader: glslViewer no va en la imagen (necesita contexto GL); usa Blender o Manim" >&2; exit 1 ;;
+  compose) exec "$0" blender "$@" ;;  # the .blend's compositor nodes run on render
+  tools)
+    printf '%-11s %s
+' blender "$("$BLENDER" -v 2>/dev/null | head -1)"
+    printf '%-11s %s
+' manim "$(manim --version 2>/dev/null | head -1)"
+    printf '%-11s %s
+' ffmpeg "$(ffmpeg -version | head -1)"
+    printf '%-11s %s
+' nvenc "$(ffmpeg -hide_banner -encoders 2>/dev/null | grep -c nvenc) encoders"
+    printf '%-11s %s
+' gpu "$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo '- (sin GPU visible)')"
+    printf '%-11s %s
+' vulkan "$(vulkaninfo --summary 2>/dev/null | grep -m1 deviceName || echo '- (sin ICD NVIDIA: usa VFX_GPU=-1 o ver README)')"
+    for b in realesrgan rife; do printf '%-11s %s
+' $b "$([ -x "$V/$b/$b-ncnn-vulkan" ] && echo ok || echo -)"; done ;;
+  *) sed -n '2,14p' "$0"; exit 2 ;;
+esac

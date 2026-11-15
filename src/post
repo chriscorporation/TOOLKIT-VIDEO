@@ -1,0 +1,159 @@
+#!/bin/bash
+# post — post-producción con ffmpeg (port Linux/NVIDIA de m1-post) (corte, audio, mezcla, capas, zoom, subtítulos, export).
+#   info <archivo>                               duración, resolución, códecs, pistas de audio (ffprobe)
+#   trim <in> <inicio> <fin> [out]               recorta (tiempos 00:01:02.5 o segundos), sin recodificar si se puede
+#   concat <out> <in1> <in2> …                   une clips (recodifica para que no falle con formatos distintos)
+#   silence <in> [out] [margen_s]                corta silencios automáticamente (auto-editor)
+#   speed <in> <factor> [out]                    acelera/desacelera video y audio (ej. 1.5 o 0.5)
+#   xfade <a> <b> [out] [fade|wipeleft|slideleft|circleopen|dissolve…] [segundos]   transición entre dos clips
+# AUDIO
+#   loudness <in> [out] [-14]                    normaliza a LUFS (−14 = YouTube) con loudnorm de 2 pasadas
+#   denoise <in> [out]                           reduce ruido de fondo (afftdn) + filtro de rumble
+#   voice <in> [out]                             cadena "voz de YouTuber": highpass, de-noise, compresor, EQ, loudnorm
+#   duck <voz> <musica> [out] [vol_musica 0.25]  la música baja sola cuando hablas (sidechaincompress)
+#   mix <out> <archivo:vol> <archivo:vol> …      mezcla N pistas con su volumen (ej. voz.wav:1 musica.mp3:0.2)
+#   channels <in> <mono|stereo|left|right|swap> [out]    convierte/mueve canales
+#   volume <in> <dB o factor> [out]              sube/baja volumen (ej. +6dB, 0.5)
+#   replace-audio <video> <audio> [out]          cambia el audio de un video
+# CAPAS Y VIDEO
+#   pip <pantalla> <camara> [out] [br|bl|tr|tl] [circle|rounded]   cámara en burbuja sobre la pantalla
+#   overlay <base> <capa> [out] [x] [y] [inicio] [fin]   superpone video/PNG/video con alfa en un intervalo
+#   chroma <in> [out] [color] [sim] [blend]      fondo verde → .mov HEVC con alfa (overlay); CHROMA_FORMAT=prores para editar
+#   zoom <in> <x> <y> <w> <h> <t_inicio> <t_fin> [out]   zoom suave a una zona y regreso (estilo Screen Studio)
+#   color <in> [out] [brillo 0.03] [contraste 1.08] [saturación 1.15]   corrección de color simple
+#   lut <in> <archivo.cube> [out]                aplica un LUT
+# TEXTO
+#   captions <in> [es|en|auto]                   subtítulos automáticos con whisper → .srt (POST_PROMPT="Google Sheets, SUM" = vocabulario)
+#   burn <in> <subs.srt> [out] [youtube|minimal] quema subtítulos con estilo
+#   title <in> "<texto>" [out] [inicio] [fin]    título animado (fade) arriba
+# VOZ
+#   tts "<texto>" [out.mp3] [voz]                ElevenLabs flash v2.5 (barata, es-MX: Alejandro Ballesteros); caché; sin llave falla (no hay `say` en Linux)
+#   narrate <guion.txt> <out.wav> [dur_s]        guion "segundo|texto" por línea → una pista con cada frase en su tiempo
+#   layers <in> <capas.txt> [out]               textos en post (nítidos tras el zoom): sub píldora, chip de capítulo, teclas, title, lower
+#   marks <in> <timeline.jsonl> [out] --area X,Y,W,H [--color #hex] [--width 4]   marcas de una toma LIMPIA dibujadas en post
+#   frame <in> [out] [--pad 80 --radius 22 --bg "#1E1B4B,#7C3AED"|img]  ventana redondeada con sombra sobre fondo (look Screen Studio), 1920x1080
+# EXPORTAR
+#   youtube <in> [out] [1080|1440|2160]          H.264 High, CRF 18, AAC 320k, faststart (subida óptima)
+#   gif <in> [out] [ancho 800] [fps 15]          GIF de alta calidad (gifski)
+#   thumb <in> <segundo> [out]                   miniatura PNG de un fotograma
+set -euo pipefail
+export PATH=/opt/ffmpeg:/opt/venv/bin:$HOME/.local/bin:$PATH
+PT=${PODTOOLS_HOME:-/opt/podtools}
+FF="ffmpeg -hide_banner -loglevel error -y"
+# The static ffmpeg in the image already has libass + freetype.
+FFT=$FF
+ext() { echo "${1##*.}"; }
+name() { local b; b=$(basename "$1"); echo "${b%.*}"; }
+out() { echo "${1:-$(dirname "$2")/$(name "$2")-$3.${4:-$(ext "$2")}}"; }
+dur() { ffprobe -v error -show_entries format=duration -of csv=p=0 "$1"; }
+cmd=${1:-}; shift || true
+case $cmd in
+  info) ffprobe -v error -show_entries format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,r_frame_rate,channels,sample_rate -of compact "$1" ;;
+  trim) o=$(out "${4:-}" "$1" trim); $FF -ss "$2" -to "$3" -i "$1" -c copy -avoid_negative_ts make_zero "$o" 2>/dev/null || $FF -ss "$2" -to "$3" -i "$1" -c:v libx264 -crf 18 -c:a aac -b:a 320k "$o"; echo "$o" ;;
+  concat) o=$1; shift; n=$#; inputs=(); fc=; i=0
+          for f in "$@"; do inputs+=(-i "$f"); fc+="[$i:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v$i];[$i:a]aresample=48000[a$i];"; i=$((i+1)); done
+          for j in $(seq 0 $((n-1))); do fc+="[v$j][a$j]"; done
+          $FF "${inputs[@]}" -filter_complex "${fc}concat=n=$n:v=1:a=1[v][a]" -map "[v]" -map "[a]" -c:v libx264 -crf 18 -preset medium -c:a aac -b:a 320k "$o"; echo "$o" ;;
+  silence) o=$(out "${2:-}" "$1" cut); auto-editor "$1" --margin "${3:-0.2}s" --output "$o" --no-open >/dev/null; echo "$o" ;;
+  speed) o=$(out "${3:-}" "$1" "x$2"); a=$2; atempo=; r=$a
+         while (( $(echo "$r > 2" | bc -l) )); do atempo+="atempo=2,"; r=$(echo "$r/2" | bc -l); done
+         while (( $(echo "$r < 0.5" | bc -l) )); do atempo+="atempo=0.5,"; r=$(echo "$r/0.5" | bc -l); done
+         $FF -i "$1" -filter_complex "[0:v]setpts=PTS/$a[v];[0:a]${atempo}atempo=$r[a]" -map "[v]" -map "[a]" -c:v libx264 -crf 18 -c:a aac -b:a 320k "$o"; echo "$o" ;;
+  xfade) o=$(out "${3:-}" "$1" xfade); t=${5:-0.8}; off=$(echo "$(dur "$1") - $t" | bc -l)
+         $FF -i "$1" -i "$2" -filter_complex "[0:v][1:v]xfade=transition=${4:-fade}:duration=$t:offset=$off,format=yuv420p[v];[0:a][1:a]acrossfade=d=$t[a]" -map "[v]" -map "[a]" -c:v libx264 -crf 18 -c:a aac -b:a 320k "$o"; echo "$o" ;;
+  loudness) o=$(out "${2:-}" "$1" loud); L=${3:--14}
+            m=$(ffmpeg -hide_banner -i "$1" -af "loudnorm=I=$L:TP=-1.5:LRA=11:print_format=json" -f null - 2>&1 | sed -n '/^{/,/^}/p')
+            ii=$(echo "$m" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["input_i"],d["input_tp"],d["input_lra"],d["input_thresh"],d["target_offset"])')
+            read -r I TP LRA TH OFF <<< "$ii"
+            $FF -i "$1" -af "loudnorm=I=$L:TP=-1.5:LRA=11:measured_I=$I:measured_TP=$TP:measured_LRA=$LRA:measured_thresh=$TH:offset=$OFF:linear=true" -ar 48000 -c:v copy -c:a aac -b:a 320k -movflags +faststart "$o"; echo "$o" ;;
+  denoise) o=$(out "${2:-}" "$1" clean); $FF -i "$1" -af "highpass=f=80,afftdn=nf=-25" -c:v copy -c:a aac -b:a 320k "$o"; echo "$o" ;;
+  voice) o=$(out "${2:-}" "$1" voice)
+         $FF -i "$1" -af "highpass=f=80,afftdn=nf=-25,acompressor=threshold=-18dB:ratio=3:attack=10:release=200:makeup=4,equalizer=f=3000:t=q:w=1:g=3,equalizer=f=200:t=q:w=1:g=-2,loudnorm=I=-14:TP=-1.5:LRA=11" -ar 48000 -c:v copy -c:a aac -b:a 320k "$o"; echo "$o" ;;
+  duck) o=${3:-$(dirname "$1")/$(name "$1")-ducked.m4a}; v=${4:-0.25}
+        $FF -i "$1" -i "$2" -filter_complex "[1:a]volume=$v,aloop=loop=-1:size=2e9[m];[m][0:a]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=400[duck];[0:a][duck]amix=inputs=2:duration=first:normalize=0[a]" -map "[a]" -c:a aac -b:a 320k "$o"; echo "$o" ;;
+  mix) o=$1; shift; inputs=(); fc=; i=0; labels=
+       for t in "$@"; do f=${t%:*}; v=${t##*:}; [ "$f" = "$t" ] && v=1; inputs+=(-i "$f"); fc+="[$i:a]volume=$v[a$i];"; labels+="[a$i]"; i=$((i+1)); done
+       $FF "${inputs[@]}" -filter_complex "${fc}${labels}amix=inputs=$i:duration=longest:normalize=0[a]" -map "[a]" -c:a aac -b:a 320k "$o"; echo "$o" ;;
+  channels) o=$(out "${3:-}" "$1" "$2")
+            case $2 in mono) af="pan=mono|c0=0.5*c0+0.5*c1" ;; stereo) af="pan=stereo|c0=c0|c1=c0" ;; left) af="pan=stereo|c0=c0|c1=c0" ;;
+                       right) af="pan=stereo|c0=c1|c1=c1" ;; swap) af="pan=stereo|c0=c1|c1=c0" ;; *) echo "canal: mono|stereo|left|right|swap" >&2; exit 2 ;; esac
+            $FF -i "$1" -af "$af" -c:v copy -c:a aac -b:a 320k "$o"; echo "$o" ;;
+  volume) o=$(out "${3:-}" "$1" vol); $FF -i "$1" -af "volume=$2" -c:v copy -c:a aac -b:a 320k "$o"; echo "$o" ;;
+  replace-audio) o=$(out "${3:-}" "$1" audio); $FF -i "$1" -i "$2" -map 0:v -map 1:a -c:v copy -c:a aac -b:a 320k -shortest "$o"; echo "$o" ;;
+  pip) o=$(out "${3:-}" "$1" pip); pos=${4:-br}; shape=${5:-circle}; S=360
+       case $pos in br) xy="W-w-60:H-h-60" ;; bl) xy="60:H-h-60" ;; tr) xy="W-w-60:60" ;; tl) xy="60:60" ;; esac
+       if [ "$shape" = circle ]; then mask="geq=lum='p(X,Y)':a='if(lt(hypot(X-$S/2,Y-$S/2),$S/2-2),255,0)'"; else mask="geq=lum='p(X,Y)':a='255'"; fi
+       $FF -i "$1" -i "$2" -filter_complex "[1:v]crop='min(iw,ih)':'min(iw,ih)',scale=$S:$S,format=yuva420p,$mask[c];[0:v][c]overlay=$xy:shortest=1[v]" -map "[v]" -map 0:a? -c:v libx264 -crf 18 -c:a copy "$o"; echo "$o" ;;
+  overlay) o=$(out "${3:-}" "$1" over); x=${4:-0}; y=${5:-0}; en=; [ -n "${6:-}" ] && en=":enable='between(t,$6,${7:-1e9})'"
+           $FF -i "$1" -i "$2" -filter_complex "[0:v][1:v]overlay=$x:$y:eof_action=pass$en[v]" -map "[v]" -map 0:a? -c:v libx264 -crf 18 -c:a copy "$o"; echo "$o" ;;
+  chroma) # Green screen → transparent clip. Linux has no HEVC-with-alpha encoder (VideoToolbox is Apple-only): default is ProRes 4444 .mov;
+          # CHROMA_FORMAT=prores → ProRes 4444 for editing. despill removes the green fringe on the edges.
+          o=${2:-$(dirname "$1")/$(name "$1")-alpha.mov}; c=${3:-0x00FF00}; sim=${4:-0.28}; bl=${5:-0.08}
+          if [ "${CHROMA_FORMAT:-prores}" = prores ]; then
+            $FF -i "$1" -vf "colorkey=$c:$sim:$bl,despill=type=green:mix=0.6,format=yuva444p10le" -c:v prores_ks -profile:v 4444 -pix_fmt yuva444p10le -an "$o"
+          else
+            echo "CHROMA_FORMAT=hevc needs Apple VideoToolbox; use prores (default) or convert on the Mac" >&2; exit 1
+          fi; echo "$o" ;;
+  zoom) o=$(out "${8:-}" "$1" zoom); x=$2; y=$3; w=$4; h=$5; t0=$6; t1=$7
+        IFS=x read -r W H <<< "$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "$1")"
+        R=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$1")
+        python3 -c "import sys;sys.exit(eval('$R')<=60)" && R=60/1   # ProMotion captures say 120 fps; 60 is plenty
+        # crop's w/h are fixed at init, so the zoom samples a moving source quad with perspective (subpixel, no jitter).
+        # p: 0→1 eased over 0.6 s from t0, back to 0 over 0.6 s from t1; zoom target fits the region in the frame.
+        # Target region: grown to the frame's aspect ratio around its center and kept inside the frame, so the zoom never
+        # distorts or shows outside the picture. The corners (not center + scale) are interpolated: a center/scale lerp
+        # drifted out of the region mid-transition (UX review, 2026-10-16). E = ease seconds (ZOOM_EASE, default 0.6).
+        read -r tx ty tw th <<< "$(python3 -c "
+W,H,x,y,w,h=$W,$H,$x,$y,$w,$h; ar=W/H
+if w/h<ar: nw=h*ar; x-=(nw-w)/2; w=nw
+else: nh=w/ar; y-=(nh-h)/2; h=nh
+w=min(w,W); h=min(h,H); x=max(0,min(x,W-w)); y=max(0,min(y,H-h)); print(round(x,2),round(y,2),round(w,2),round(h,2))")"
+        T="(in*${R#*/}/${R%/*})"; E=${ZOOM_EASE:-0.6}
+        p="if(lt($T,$t0),0,if(lt($T,$t0+$E),(1-cos(($T-$t0)/$E*PI))/2,if(lt($T,$t1),1,if(lt($T,$t1+$E),(1+cos(($T-$t1)/$E*PI))/2,0))))"
+        L="($tx*$p)"; Tp="($ty*$p)"; Rr="($W+($tx+$tw-$W)*$p)"; B="($H+($ty+$th-$H)*$p)"
+        # fps= first: screen captures are variable frame rate, and in/fps is only real time on a constant-rate stream.
+        $FF -i "$1" -vf "fps=$R,perspective=x0='$L':y0='$Tp':x1='$Rr':y1='$Tp':x2='$L':y2='$B':x3='$Rr':y3='$B':interpolation=cubic:eval=frame,setsar=1" -c:v libx264 -crf 18 -c:a copy "$o"; echo "$o" ;;
+  color) o=$(out "${2:-}" "$1" color); $FF -i "$1" -vf "eq=brightness=${3:-0.03}:contrast=${4:-1.08}:saturation=${5:-1.15}" -c:v libx264 -crf 18 -c:a copy "$o"; echo "$o" ;;
+  lut) o=$(out "${3:-}" "$1" lut); $FF -i "$1" -vf "lut3d=$2" -c:v libx264 -crf 18 -c:a copy "$o"; echo "$o" ;;
+  captions) lang=${2:-es}; base=$(dirname "$1")/$(name "$1")
+            python3 "$PT/whisper-srt.py" "$1" "$lang" "$base.srt" "${POST_PROMPT:-}"; echo "$base.srt" ;;
+  burn) o=$(out "${3:-}" "$1" subs)
+        style=${4:-youtube}; [ "$style" = youtube ] && fs="FontName=Liberation Sans,FontSize=22,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1,MarginV=40" \
+          || fs="FontName=Liberation Sans,FontSize=18,PrimaryColour=&H00FFFFFF,BackColour=&H80000000,BorderStyle=4,Outline=0,MarginV=30"
+        $FFT -i "$1" -vf "subtitles='$2':force_style='$fs'" -c:v libx264 -crf 18 -c:a copy "$o"; echo "$o" ;;
+  title) o=$(out "${3:-}" "$1" title); s=${4:-0}; e=${5:-4}; txt=$(printf '%s' "$2" | sed "s/'/\\\\'/g; s/:/\\\\:/g")
+         $FFT -i "$1" -vf "drawtext=text='$txt':fontfile=/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf:fontsize=64:fontcolor=white:borderw=4:bordercolor=black:x=(w-tw)/2:y=h*0.08:alpha='if(lt(t,$s),0,if(lt(t,$s+0.5),(t-$s)/0.5,if(lt(t,$e-0.5),1,if(lt(t,$e),($e-t)/0.5,0))))'" -c:v libx264 -crf 18 -c:a copy "$o"; echo "$o" ;;
+  tts) txt=$1; o=${2:-$PWD/tts-$(date +%H%M%S).mp3}; v=${3:-${M1_TTS_VOICE:?define M1_TTS_VOICE}}
+       # Cheapest ElevenLabs model (flash v2.5, 0.5 credit/char); identical text+voice is cached so retakes are free.
+       C=$HOME/.cache/podtools/tts; mkdir -p "$C"; h=$(printf '%s|%s|flash' "$v" "$txt" | sha256sum | cut -c1-24)
+       if [ ! -s "$C/$h.mp3" ] && [ -n "${ELEVENLABS_API_KEY:-}" ]; then
+         body=$(python3 -c 'import json,sys;print(json.dumps({"text":sys.argv[1],"model_id":"eleven_flash_v2_5","language_code":"es","voice_settings":{"stability":0.6,"similarity_boost":0.8,"speed":1.0}}))' "$txt")
+         code=$(curl -s -m 60 -o "$C/$h.mp3" -w '%{http_code}' -X POST "https://api.elevenlabs.io/v1/text-to-speech/$v?output_format=mp3_44100_128" \
+           -H "xi-api-key: $ELEVENLABS_API_KEY" -H 'Content-Type: application/json' -d "$body")
+         [ "$code" = 200 ] || { echo "ElevenLabs $code: $(head -c 200 "$C/$h.mp3")" >&2; rm -f "$C/$h.mp3"; }
+       fi
+       if [ -s "$C/$h.mp3" ]; then cp "$C/$h.mp3" "$o"; else echo "tts: falta ELEVENLABS_API_KEY (o falló la API) y no hay 'say' en Linux" >&2; exit 1; fi
+       echo "$o" ;;
+  narrate) g=$1; o=$2; D=$(mktemp -d); n=0; args=(); fc=; lab=
+           while IFS='|' read -r t txt || [ -n "$t" ]; do
+             [[ -z $t || $t == \#* ]] && continue
+             "$0" tts "$txt" "$D/n$n.mp3" >/dev/null || exit 1
+             ms=$(python3 -c "print(int(float('$t')*1000))"); args+=(-i "$D/n$n.mp3")
+             fc+="[$n:a]aresample=48000,aformat=channel_layouts=stereo,adelay=$ms|$ms[a$n];"; lab+="[a$n]"; n=$((n+1))
+           done < "$g"
+           pad=; [ -n "${3:-}" ] && pad=",apad=whole_dur=$3"
+           $FF "${args[@]}" -filter_complex "${fc}${lab}amix=inputs=$n:normalize=0$pad[o]" -map "[o]" ${3:+-t $3} "$o"; rm -rf "$D"; echo "$o" ;;
+  marks) i=$1; tl=$2; shift 2; o=$(dirname "$i")/$(name "$i")-marks.mp4; [ $# -gt 0 ] && [ "${1#--}" = "$1" ] && { o=$1; shift; }
+         python3 "$PT/marks.py" "$i" "$tl" "$o" "$@"; echo "$o" ;;
+  frame) i=$1; shift; o=$(dirname "$i")/$(name "$i")-frame.mp4; [ $# -gt 0 ] && [ "${1#--}" = "$1" ] && { o=$1; shift; }
+         python3 "$PT/frame.py" "$i" "$o" "$@" >/dev/null; echo "$o" ;;
+  layers) o=${3:-$(dirname "$1")/$(name "$1")-layers.mp4}; python3 "$PT/layers.py" "$1" "$2" "$o" >/dev/null; echo "$o" ;;
+  youtube) o=${2:-$(dirname "$1")/$(name "$1")-youtube.mp4}; h=${3:-1080}
+           # YouTube tops out at 60 fps; screen captures (VFR, up to 120 on ProMotion) go to a constant rate ≤ 60.
+           r=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$1"); python3 -c "import sys;sys.exit(eval('$r')<=60)" && r=60
+           $FF -i "$1" -vf "fps=$r,scale=-2:$h:flags=lanczos,format=yuv420p" -c:v libx264 -profile:v high -preset slow -crf 18 -g 60 -bf 2 -c:a aac -b:a 320k -ar 48000 -ac 2 -movflags +faststart "$o"; echo "$o" ;;
+  gif) o=${2:-$(dirname "$1")/$(name "$1").gif}; fr=$(mktemp -d); $FF -i "$1" -vf "fps=${4:-15},scale=${3:-800}:-1:flags=lanczos" "$fr/f%05d.png"
+       gifski --fps "${4:-15}" --width "${3:-800}" -o "$o" "$fr"/f*.png >/dev/null; rm -rf "$fr"; echo "$o" ;;
+  thumb) o=${3:-$(dirname "$1")/$(name "$1")-thumb.png}; $FF -ss "$2" -i "$1" -frames:v 1 "$o"; echo "$o" ;;
+  *) sed -n '2,39p' "$0"; exit 2 ;;
+esac

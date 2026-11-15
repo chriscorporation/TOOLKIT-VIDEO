@@ -1,0 +1,10 @@
+#!/bin/sh
+# `hyperframes render` with a fixed worker count. HyperFrames' auto-calibration measures software-GPU capture as
+# "slow" and drops to 1 worker; on the droplet 3 fixed workers render 1.7x faster (3 s reel: 58.8 s -> 33.9 s).
+# An explicit --workers/-w from the caller always wins. HF_RENDER_WORKERS empty = upstream behavior.
+REAL=/opt/node/bin/hyperframes
+if [ "$1" = render ] && [ -n "${HF_RENDER_WORKERS:-}" ]; then
+  for a in "$@"; do case "$a" in --workers|--workers=*|-w) exec "$REAL" "$@" ;; esac; done
+  shift; exec "$REAL" render --workers "$HF_RENDER_WORKERS" "$@"
+fi
+exec "$REAL" "$@"
