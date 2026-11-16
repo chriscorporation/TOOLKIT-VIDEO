@@ -100,7 +100,9 @@ auto_editor_arm() {
 podtools() {  # same-name Linux equivalents of macOS-only commands: say, sips, mlx_whisper, m1-post/m1-vfx…
   rm -rf /opt/podtools.new && cp -r "$PODTOOLS_SRC" /opt/podtools.new && rm -rf /opt/podtools && mv /opt/podtools.new /opt/podtools
   rm -f /opt/podtools/bin/claude-swap   # account swap is the container's; never on a runner
-  sed -i "s#^REAL=/opt/node/bin/hyperframes#REAL=/home/$RUN_USER/.npm-global/bin/hyperframes#" /opt/podtools/bin/hyperframes 2>/dev/null   # container path → runner's pinned HF
+  for r in "/home/$RUN_USER/.npm-global/bin/hyperframes" /usr/local/bin/hyperframes /opt/node/bin/hyperframes; do   # wherever THIS machine has HyperFrames
+    [ -x "$r" ] && { sed -i "s#^REAL=.*#REAL=$r#" /opt/podtools/bin/hyperframes 2>/dev/null; break; }                # (image: /usr/local/bin; runner: ~/.npm-global)
+  done
   cd /opt/podtools && chmod +x post vfx whisper-srt.py smoke say sips mlx_whisper m1-review-pack mac-compat 2>/dev/null
   for c in post vfx smoke say sips mlx_whisper m1-review-pack viewers; do ln -sf /opt/podtools/$c /usr/local/bin/$c; done
   ln -sf /opt/podtools/chrome-userscripts.mjs /usr/local/bin/chrome-userscripts
